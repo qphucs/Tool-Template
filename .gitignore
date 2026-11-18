@@ -1,0 +1,12 @@
+# Môi trường ảo và cache Python
+.venv/
+__pycache__/
+*.pyc
+
+# Cấu hình cục bộ của Claude Code
+.claude/
+
+# Dữ liệu cá nhân và sinh ra khi chạy: project CapCut đã học, ảnh/nhạc đầu vào, kết quả phân tích,
+# ảnh chụp thao tác đăng, sao lưu danh sách project. Không đưa lên GitHub.
+data/
+input/

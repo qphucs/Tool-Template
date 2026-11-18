@@ -1,0 +1,17 @@
+# Giao diện
+PySide6>=6.7
+# Dò beat và xử lý âm thanh
+librosa>=0.10.2
+soundfile>=0.12.1
+numpy>=1.26
+# Tự động hóa giao diện CapCut (giai đoạn đăng)
+pywinauto>=0.6.8
+opencv-python>=4.10
+mss>=9.0
+# Viết tiêu đề/hashtag
+anthropic>=0.40
+pyyaml>=6.0.1
+# Đọc chữ trong video mẫu. EasyOCR kéo theo opencv-python-headless, trùng với opencv-python ở trên:
+# sau khi cài, gỡ bản headless rồi cài lại opencv-python:
+#   pip uninstall -y opencv-python-headless && pip install --force-reinstall --no-deps opencv-python
+easyocr>=1.7.2
