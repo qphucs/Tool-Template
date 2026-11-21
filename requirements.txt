@@ -15,3 +15,4 @@ pyyaml>=6.0.1
 # sau khi cài, gỡ bản headless rồi cài lại opencv-python:
 #   pip uninstall -y opencv-python-headless && pip install --force-reinstall --no-deps opencv-python
 easyocr>=1.7.2
+google-genai>=1.0

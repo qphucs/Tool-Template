@@ -6,14 +6,18 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QButtonGroup, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
+from ..ai.client import AIConfig, status
 from ..formula.learn import list_formulas
 from ..generate.build import build_content, generate, make_caption
+from ..generate.variants import plan_variants, run_batch
 from ..generate.writer import capcut_running
 from ..media import IMAGE_EXT, VIDEO_EXT
+from .ai_dialog import AIConfigDialog
 from .common import Settings, error, run_in_background
 
 AUDIO_FILTER = "Nhạc (*.mp3 *.m4a *.wav *.aac *.flac *.ogg)"
@@ -117,6 +121,44 @@ class GenerateTab(QWidget):
         self.create_btn.setObjectName("primary")
         self.log = QPlainTextEdit(readOnly=True)
 
+        # prompt tạo nhiều biến thể
+        self.prompt = QPlainTextEdit(settings.get("variant_prompt"),
+                                     placeholderText="Ví dụ: tạo 8 mẫu cho ảnh couple: 3 tone tối giản, "
+                                                     "2 neon, 2 retro, 1 điện ảnh. Ưu tiên nhịp nhanh, chữ to.")
+        self.prompt.setMaximumHeight(78)
+        self.count = QSpinBox()
+        self.count.setRange(1, 30)
+        try:
+            self.count.setValue(int(settings.get("variant_count", 6) or 6))
+        except (TypeError, ValueError):
+            self.count.setValue(6)
+        self.vary = QCheckBox("Biến tấu công thức (cắt bớt beat đầu, đổi số ô thay)")
+        self.vary.setChecked(bool(settings.get("variant_vary", True)))
+        self.ai_label = QLabel()
+        self.ai_label.setObjectName("muted")
+        self.ai_config_btn = QPushButton("Cấu hình AI…")
+        self.batch_dry_btn = QPushButton("Chạy thử prompt")
+        self.batch_btn = QPushButton("Tạo nhiều mẫu theo prompt")
+        self.batch_btn.setObjectName("primary")
+
+        prompt_box = QGroupBox("Prompt tạo nhiều mẫu")
+        prompt_row = QHBoxLayout()
+        prompt_row.addWidget(self.prompt, 1)
+        side = QVBoxLayout()
+        side.addWidget(QLabel("Số mẫu:"))
+        side.addWidget(self.count)
+        side.addWidget(self.vary)
+        side.addStretch()
+        prompt_row.addLayout(side)
+        prompt_bottom = QHBoxLayout()
+        prompt_bottom.addWidget(self.ai_label, 1)
+        prompt_bottom.addWidget(self.ai_config_btn)
+        prompt_bottom.addWidget(self.batch_dry_btn)
+        prompt_bottom.addWidget(self.batch_btn)
+        prompt_layout = QVBoxLayout(prompt_box)
+        prompt_layout.addLayout(prompt_row)
+        prompt_layout.addLayout(prompt_bottom)
+
         top = QHBoxLayout()
         top.addWidget(QLabel("Khung mẫu:"))
         top.addWidget(self.formula_box, 1)
@@ -132,6 +174,7 @@ class GenerateTab(QWidget):
         layout.addLayout(top)
         layout.addWidget(self.formula_info)
         layout.addLayout(boxes)
+        layout.addWidget(prompt_box)
         layout.addLayout(buttons)
         layout.addWidget(QLabel("Nhật ký:"))
         layout.addWidget(self.log, 1)
@@ -148,8 +191,12 @@ class GenerateTab(QWidget):
             b.toggled.connect(self._update_enabled)
         self.dry_btn.clicked.connect(lambda: self._run(dry=True))
         self.create_btn.clicked.connect(lambda: self._run(dry=False))
+        self.batch_dry_btn.clicked.connect(lambda: self._run_batch(dry=True))
+        self.batch_btn.clicked.connect(lambda: self._run_batch(dry=False))
+        self.ai_config_btn.clicked.connect(self._configure_ai)
         self.reload_formulas()
         self._update_enabled()
+        self._update_ai_label()
 
     # ---------- trạng thái ----------
     def reload_formulas(self) -> None:
@@ -234,39 +281,52 @@ class GenerateTab(QWidget):
         self.log.appendPlainText(text)
 
     # ---------- chạy ----------
-    def _run(self, dry: bool) -> None:
+    def _collect_inputs(self):
+        """Kiểm tra lựa chọn chung cho cả tạo đơn và tạo hàng loạt."""
         formula = self._formula()
         if formula is None:
             error(self, "Chưa có khung mẫu nào. Hãy học khung mẫu ở tab Học mẫu trước.")
-            return
+            return None
         if self.other_music.isChecked():
             musics = _paths(self.music_list)
             if not musics:
                 error(self, "Bạn chưa thêm bài nhạc nào.")
-                return
+                return None
         else:
             musics = [None]
-        if self.ordered.isChecked():
+        ordered = self.ordered.isChecked()
+        if ordered:
             materials = _paths(self.photo_list)
             if len(materials) != len(formula["slots"]):
                 error(self, f"Khung mẫu có {len(formula['slots'])} ô thay nên cần đúng {len(formula['slots'])} ảnh/clip, "
                             f"bạn đang chọn {len(materials)}.")
-                return
+                return None
         else:
             materials = self.materials.text().strip()
             if not materials or not Path(materials).is_dir():
                 error(self, "Hãy chọn thư mục ảnh/clip.")
-                return
+                return None
             self.settings.set("materials_dir", materials)
-        if not dry:
-            while capcut_running():
-                answer = QMessageBox.question(
-                    self, "CapCut đang mở",
-                    "Hãy tắt CapCut trước khi tạo mẫu, để CapCut không ghi đè danh sách project.\n\n"
-                    "Tắt xong bấm Thử lại.",
-                    QMessageBox.Retry | QMessageBox.Cancel)
-                if answer != QMessageBox.Retry:
-                    return
+        return formula, musics, materials, ordered
+
+    def _ask_close_capcut(self) -> bool:
+        while capcut_running():
+            answer = QMessageBox.question(
+                self, "CapCut đang mở",
+                "Hãy tắt CapCut trước khi tạo mẫu, để CapCut không ghi đè danh sách project.\n\n"
+                "Tắt xong bấm Thử lại.",
+                QMessageBox.Retry | QMessageBox.Cancel)
+            if answer != QMessageBox.Retry:
+                return False
+        return True
+
+    def _run(self, dry: bool) -> None:
+        inputs = self._collect_inputs()
+        if inputs is None:
+            return
+        formula, musics, materials, _ = inputs
+        if not dry and not self._ask_close_capcut():
+            return
         self.settings.set("style_hint", self.style_hint.text())
 
         hint = self.style_hint.text().strip()
@@ -301,6 +361,42 @@ class GenerateTab(QWidget):
 
         run_in_background(work, lambda lines: self._done(lines, dry), self._failed)
 
+    def _run_batch(self, dry: bool) -> None:
+        inputs = self._collect_inputs()
+        if inputs is None:
+            return
+        formula, musics, materials, ordered = inputs
+        if not dry and not self._ask_close_capcut():
+            return
+
+        prompt = self.prompt.toPlainText().strip()
+        hint = self.style_hint.text().strip()
+        count = self.count.value()
+        vary = self.vary.isChecked()
+        self.settings.set("style_hint", hint)
+        self.settings.set("variant_prompt", prompt)
+        self.settings.set("variant_count", count)
+        self.settings.set("variant_vary", vary)
+        config = AIConfig.load(self.settings)
+
+        full_prompt = prompt
+        if hint:
+            full_prompt = f"{prompt}\nPhong cách chung: {hint}".strip()
+
+        stamp = datetime.now().strftime("%d%m %H%M")
+        self._set_busy(True)
+        self._write(f"\n=== {'Chạy thử prompt' if dry else 'Tạo nhiều mẫu'} · khung {formula['name']} · {count} mẫu")
+
+        def work():
+            plans, note = plan_variants(formula, full_prompt, count, len(musics), config=config)
+            lines = [f"Kế hoạch: {note}"]
+            lines.extend(f"   {p.index + 1}. {p.style} · {p.source}" for p in plans)
+            batch = run_batch(formula, plans, musics, materials,
+                              dry=dry, stamp=stamp, ordered=ordered, vary=vary)
+            return lines + batch.lines, batch.created, batch.total
+
+        run_in_background(work, lambda result: self._batch_done(result, dry), self._failed)
+
     def _done(self, lines: list[str], dry: bool) -> None:
         for line in lines:
             self._write(line)
@@ -314,11 +410,39 @@ class GenerateTab(QWidget):
         else:
             self._write("Không tạo được mẫu nào, xem lỗi ở trên.")
 
+    def _batch_done(self, result, dry: bool) -> None:
+        lines, created, total = result
+        for line in lines:
+            self._write(line)
+        self._set_busy(False)
+        if dry:
+            return
+        if created:
+            self._write(f"Đã tạo {created}/{total} mẫu. Mở CapCut để xem; hồ sơ đăng nằm ở tab Đăng.")
+            self.drafts_created.emit()
+        else:
+            self._write("Không tạo được mẫu nào, xem lỗi ở trên.")
+
     def _failed(self, message: str) -> None:
         self._write(f"✗ Lỗi: {message}")
         self._set_busy(False)
 
+    def _configure_ai(self) -> None:
+        dialog = AIConfigDialog(self.settings, self)
+        if dialog.exec():
+            self._update_ai_label()
+
+    def _update_ai_label(self) -> None:
+        self.ai_label.setText(status(self.settings))
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._update_ai_label()
+
     def _set_busy(self, busy: bool) -> None:
         self.dry_btn.setEnabled(not busy)
         self.create_btn.setEnabled(not busy)
+        self.batch_dry_btn.setEnabled(not busy)
+        self.batch_btn.setEnabled(not busy)
         self.create_btn.setText("Đang xử lý…" if busy else "Tạo mẫu trong CapCut")
+        self.batch_btn.setText("Đang tạo…" if busy else "Tạo nhiều mẫu theo prompt")

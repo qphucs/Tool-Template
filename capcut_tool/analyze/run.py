@@ -50,7 +50,13 @@ def analyze_video(path: str | Path, read_text: bool = True,
     progress("Đọc khung hình…")
     v = load_video(video)
     progress("Tách nhạc và dò beat…")
-    music = extract_audio(video, out / "music.m4a")
+    try:
+        music = extract_audio(video, out / "music.m4a")
+    except FileNotFoundError:
+        # Visual scene analysis remains useful when FFmpeg is not installed;
+        # audio/beat analysis is simply unavailable in that environment.
+        music = None
+        progress("Không có FFmpeg; bỏ qua trích xuất âm thanh…")
     grid: BeatGrid | None = detect_beats(music) if music else None
     beat = (lambda f: round(grid.to_beat(f / v.fps), 3)) if grid else (lambda f: None)
 

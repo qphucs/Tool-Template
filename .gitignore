@@ -1,12 +1,1 @@
-# Môi trường ảo và cache Python
-.venv/
-__pycache__/
-*.pyc
-
-# Cấu hình cục bộ của Claude Code
-.claude/
-
-# Dữ liệu cá nhân và sinh ra khi chạy: project CapCut đã học, ảnh/nhạc đầu vào, kết quả phân tích,
-# ảnh chụp thao tác đăng, sao lưu danh sách project. Không đưa lên GitHub.
-data/
-input/
+# Môi trường ảo và cache Python\n.venv/\n__pycache__/\n*.pyc\n\n# Cấu hình cục bộ của Claude Code\n.claude/\n\n# Dữ liệu cá nhân và sinh ra khi chạy: project CapCut đã học, ảnh/nhạc đầu vào, kết quả phân tích,\n# ảnh chụp thao tác đăng, sao lưu danh sách project. Không đưa lên GitHub.\ndata/\ninput/\n.env*\n!.env.example\n

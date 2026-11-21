@@ -6,6 +6,7 @@ import random
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from ..audio.beats import detect_beats
 from ..caption.writer import Caption, TemplateInfo, effects_summary, write_caption
@@ -38,7 +39,6 @@ def formula_music(formula: dict) -> Path:
     if not path.is_file():
         raise ValueError(f"Không còn file nhạc gốc của khung mẫu: {path}")
     return path
-
 
 def build_content(formula: dict, music_path: str | Path | None, materials: Materials,
                   seed: int | None = None) -> BuildResult:
@@ -93,6 +93,30 @@ def generate(formula: dict, music_path: str | Path | None, materials: Materials,
     folder = write_draft(Path(formula["source"]["folder"]), name, result.content)
     info = template_info(formula, result, style_hint)
     caption = write_caption(info)
+    save_record(formula, folder, result, info, caption)
+    return folder, result, caption
+
+
+def generate_with_caption(formula: dict, music_path: str | Path | None, materials: Materials,
+                          name: str, caption_factory: Callable[[TemplateInfo], Caption],
+                          seed: int | None = None,
+                          style_hint: str = "") -> tuple[Path, BuildResult, Caption]:
+    """Như ``generate`` nhưng tự tạo caption từ thông tin mẫu.
+
+    Dùng cho batch: kế hoạch biến thể đã có tiêu đề/hashtag riêng, không cần
+    gọi lại AI cho từng project.
+    """
+    result = build_content(formula, music_path, materials, seed)
+    folder = write_draft(Path(formula["source"]["folder"]), name, result.content)
+    info = template_info(formula, result, style_hint)
+    caption = caption_factory(info)
+    save_record(formula, folder, result, info, caption)
+    return folder, result, caption
+
+
+def save_record(formula: dict, folder: Path, result: BuildResult,
+                info: TemplateInfo, caption: Caption) -> Path:
+    """Lưu hồ sơ đăng của một project mới vào data/outputs."""
     record = {
         "draft_name": folder.name,
         "draft_folder": str(folder),
@@ -106,5 +130,8 @@ def generate(formula: dict, music_path: str | Path | None, materials: Materials,
         "status": "chờ đăng",
     }
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    (OUTPUTS_DIR / f"{folder.name}.json").write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
-    return folder, result, caption
+    path = OUTPUTS_DIR / f"{folder.name}.json"
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
+    return path
+
+\n

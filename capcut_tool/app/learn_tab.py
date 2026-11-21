@@ -5,12 +5,15 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QPlainTextEdit,
 )
 
+from ..ai.client import AIConfig, status
 from ..capcut.drafts import DraftInfo, list_drafts
+from ..formula.autolearn import BatchLearnResult, learn_batch, select_drafts
 from ..formula.learn import learn, list_formulas, media_segments, save, set_slots
-from .common import error, run_in_background
+from .ai_dialog import AIConfigDialog
+from .common import Settings, error, run_in_background
 
 SHORT_DRAFT_S = 30  # mẫu của bạn dưới 15 giây; để rộng ra một chút
 
@@ -18,8 +21,9 @@ SHORT_DRAFT_S = 30  # mẫu của bạn dưới 15 giây; để rộng ra một 
 class LearnTab(QWidget):
     formulas_changed = Signal()
 
-    def __init__(self):
+    def __init__(self, settings: Settings):
         super().__init__()
+        self.settings = settings
         self.drafts: list[DraftInfo] = []
         self.formulas: list[dict] = []
         self.current: dict | None = None
@@ -27,6 +31,21 @@ class LearnTab(QWidget):
         # bên trái: project CapCut
         self.search = QLineEdit(placeholderText="Tìm project theo tên…")
         self.only_short = QCheckBox(f"Chỉ project dưới {SHORT_DRAFT_S} giây", checked=True)
+        self.batch_prompt = QLineEdit(
+            settings.get("learn_prompt"),
+            placeholderText="Prompt tự học: vd 'project dưới 15 giây, tên có remix' (trống = tất cả)")
+        self.relearn = QCheckBox("Học lại project đã học")
+        self.relearn.setChecked(bool(settings.get("learn_relearn", False)))
+        self.learning_instruction = QPlainTextEdit(settings.get("learn_instruction_prompt", ""))
+        self.learning_instruction.setPlaceholderText("Ví dụ: Ưu tiên mẫu có nhịp cắt rõ, nhiều cảnh ngắn và bố cục phù hợp video dọc. Bỏ qua project lỗi hoặc thiếu nhạc nền.")
+        self.learning_instruction.setMaximumHeight(76)
+        self.learning_instruction.setToolTip("Hướng dẫn này được lưu trong ứng dụng trên máy và gửi cho model AI khi chọn project để học.")
+        self.ai_btn = QPushButton("AI…")
+        self.ai_btn.setToolTip(status(settings))
+        self.batch_btn = QPushButton("Tự học hàng loạt")
+        self.batch_status = QLabel()
+        self.batch_status.setObjectName("muted")
+        self.batch_status.setWordWrap(True)
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Project", "Độ dài", "Sửa lần cuối", "Công thức"])
         self.table.setIconSize(QPixmap(48, 64).size())
@@ -37,7 +56,7 @@ class LearnTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.learn_btn = QPushButton("Học công thức từ các project đã tick")
         self.learn_btn.setObjectName("primary")
-        refresh = QPushButton("Tải lại danh sách")
+        self.refresh_btn = QPushButton("Tải lại danh sách")
 
         left = QVBoxLayout()
         left.addWidget(QLabel("<b>1. Tick project mẫu để học</b>"))
@@ -45,12 +64,21 @@ class LearnTab(QWidget):
         row.addWidget(self.search, 1)
         row.addWidget(self.only_short)
         left.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(self.batch_prompt, 1)
+        row.addWidget(self.relearn)
+        row.addWidget(self.ai_btn)
+        left.addLayout(row)
+        left.addWidget(QLabel("<b>Hướng dẫn AI khi chọn project để học</b>"))
+        left.addWidget(self.learning_instruction)
         left.addWidget(self.table, 1)
         row = QHBoxLayout()
-        row.addWidget(refresh)
+        row.addWidget(self.refresh_btn)
         row.addStretch()
+        row.addWidget(self.batch_btn)
         row.addWidget(self.learn_btn)
         left.addLayout(row)
+        left.addWidget(self.batch_status)
 
         # bên phải: công thức đã học và ô thay
         self.formula_list = QListWidget()
@@ -83,8 +111,10 @@ class LearnTab(QWidget):
 
         self.search.textChanged.connect(self._fill_drafts)
         self.only_short.toggled.connect(self._fill_drafts)
-        refresh.clicked.connect(self.reload)
+        self.refresh_btn.clicked.connect(self.reload)
         self.learn_btn.clicked.connect(self._learn_checked)
+        self.batch_btn.clicked.connect(self._learn_all)
+        self.ai_btn.clicked.connect(self._configure_ai)
         self.formula_list.currentRowChanged.connect(self._show_formula)
         self.save_slots_btn.clicked.connect(self._save_slots)
         self.reload()
@@ -99,12 +129,16 @@ class LearnTab(QWidget):
         self._reload_formulas()
         self._fill_drafts()
 
+    def _visible_drafts(self) -> list[DraftInfo]:
+        """Project đang hiện theo ô tìm kiếm và bộ lọc độ dài."""
+        text = self.search.text().strip().lower()
+        return [d for d in self.drafts
+                if (not text or text in d.name.lower())
+                and (not self.only_short.isChecked() or d.duration_s < SHORT_DRAFT_S)]
+
     def _fill_drafts(self) -> None:
         learned = {f["source"]["draft_id"]: f for f in self.formulas}
-        text = self.search.text().strip().lower()
-        shown = [d for d in self.drafts
-                 if (not text or text in d.name.lower())
-                 and (not self.only_short.isChecked() or d.duration_s < SHORT_DRAFT_S)]
+        shown = self._visible_drafts()
         self.table.setRowCount(len(shown))
         for r, d in enumerate(shown):
             name = QTableWidgetItem(d.name)
@@ -129,6 +163,7 @@ class LearnTab(QWidget):
             error(self, "Bạn chưa tick project nào.")
             return
         self.learn_btn.setEnabled(False)
+        self.batch_btn.setEnabled(False)
         self.learn_btn.setText(f"Đang học {len(drafts)} project…")
 
         def work():
@@ -156,7 +191,87 @@ class LearnTab(QWidget):
 
     def _reset_learn_btn(self) -> None:
         self.learn_btn.setEnabled(True)
+        self.batch_btn.setEnabled(True)
         self.learn_btn.setText("Học công thức từ các project đã tick")
+
+    # ---------- tự học hàng loạt ----------
+    def _learn_all(self) -> None:
+        if not self.drafts:
+            error(self, "Chưa đọc được project CapCut nào. Bấm Tải lại danh sách.")
+            return
+        pool = self._visible_drafts()
+        if not pool:
+            error(self, "Không có project nào đang hiện để học.")
+            return
+
+        already = set() if self.relearn.isChecked() else {
+            f["source"]["draft_id"] for f in self.formulas}
+        prompt = self.batch_prompt.text().strip()
+        instruction = self.learning_instruction.toPlainText().strip()
+        config = AIConfig.load(self.settings)
+        self.settings.set("learn_prompt", prompt)
+        self.settings.set("learn_instruction_prompt", instruction)
+        self.settings.set("learn_relearn", self.relearn.isChecked())
+        self._set_batch_busy(True, "Đang chọn project theo prompt…")
+        run_in_background(
+            lambda: select_drafts(pool, prompt, config=config, already_ids=already,
+                                  learning_instruction=instruction),
+            self._offer_batch, self._batch_failed)
+
+    def _offer_batch(self, result) -> None:
+        selected, note = result
+        self._set_batch_busy(False)
+        self.batch_status.setText(note)
+        if not selected:
+            error(self, note or "Không tìm thấy project phù hợp với prompt.")
+            return
+
+        preview = "\n".join(f"• {d.name} ({d.duration_s:.1f}s)" for d in selected[:12])
+        if len(selected) > 12:
+            preview += f"\n… và {len(selected) - 12} project nữa"
+        question = (f"{note}\n\nSẽ học {len(selected)} project:\n{preview}\n\n"
+                    "Tiếp tục? (dò beat có thể mất vài phút)")
+        if QMessageBox.question(self, "Tự học hàng loạt", question,
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            self.batch_status.setText("Đã huỷ tự học hàng loạt.")
+            return
+        self._start_batch(selected)
+
+    def _start_batch(self, selected: list[DraftInfo]) -> None:
+        self._set_batch_busy(True, f"Đang học {len(selected)} project… (dò beat có thể lâu)")
+        run_in_background(lambda: learn_batch(selected), self._batch_learn_done, self._batch_failed)
+
+    def _batch_learn_done(self, result: BatchLearnResult) -> None:
+        self._set_batch_busy(False)
+        self.batch_status.setText(
+            f"Đã học {len(result.learned)}/{result.selected} project"
+            + (f", {len(result.failed)} lỗi." if result.failed else "."))
+        self.reload()
+        self.formulas_changed.emit()
+        if result.failed:
+            more = "" if len(result.failed) <= 12 else f"\n… và {len(result.failed) - 12} lỗi nữa"
+            error(self, "Một số project không học được:\n" + "\n".join(result.failed[:12]) + more)
+
+    def _batch_failed(self, message: str) -> None:
+        self._set_batch_busy(False)
+        self.batch_status.setText("Tự học hàng loạt lỗi.")
+        error(self, message)
+
+    def _set_batch_busy(self, busy: bool, text: str = "") -> None:
+        for widget in (self.batch_btn, self.learn_btn, self.refresh_btn,
+                       self.batch_prompt, self.learning_instruction, self.relearn, self.ai_btn):
+            widget.setEnabled(not busy)
+        if text:
+            self.batch_status.setText(text)
+
+    def _configure_ai(self) -> None:
+        dialog = AIConfigDialog(self.settings, self)
+        if dialog.exec():
+            self.ai_btn.setToolTip(status(self.settings))
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.ai_btn.setToolTip(status(self.settings))
 
     # ---------- công thức ----------
     def _reload_formulas(self) -> None:
