@@ -11,6 +11,9 @@ from typing import Callable
 from ..audio.beats import detect_beats
 from ..caption.writer import Caption, TemplateInfo, effects_summary, write_caption
 from ..media import probe
+from types import SimpleNamespace
+
+from .compose import BeatPlan, Structure, compose, default_plan, music_grid, write_beat_marks
 from .materials import fill_slots, fill_slots_ordered, list_materials, replace_music
 from .retime import NewTimeline, match_tempo, retime
 from .writer import write_draft
@@ -31,6 +34,7 @@ class BuildResult:
     slots: list[str]          # ô thay còn lại sau khi cắt bớt
     music: Path               # nhạc thực sự đã dùng
     truncated_s: float = 0.0  # số giây cuối mẫu bị cắt vì nhạc ngắn hơn công thức
+    summary: str = ""         # mô tả cách ghép các phần (chế độ link động)
 
 
 def formula_music(formula: dict) -> Path:
@@ -41,7 +45,8 @@ def formula_music(formula: dict) -> Path:
     return path
 
 def build_content(formula: dict, music_path: str | Path | None, materials: Materials,
-                  seed: int | None = None) -> BuildResult:
+                  seed: int | None = None, beat_plan: BeatPlan | None = None,
+                  dynamic: bool = False, structure: Structure | None = None) -> BuildResult:
     """Tạo nội dung project mới trong bộ nhớ, chưa ghi gì ra đĩa.
 
     music_path None: giữ nhạc của khung mẫu, nhịp và độ dài giữ nguyên như bạn đã edit.
@@ -51,6 +56,8 @@ def build_content(formula: dict, music_path: str | Path | None, materials: Mater
 
     same_music = music_path is None
     music = probe(formula_music(formula) if same_music else music_path)
+    if dynamic or beat_plan is not None:
+        return _build_dynamic(content, formula, music, same_music, materials, seed, beat_plan, structure)
     grid = match_tempo(detect_beats(music.path), formula["music"]["tempo"])
     # cùng bài nhạc thì neo đúng đoạn nhạc bạn đã dùng, khỏi dời sang beat khác
     anchor = formula["music"]["source_start_s"] if same_music else None
@@ -70,6 +77,37 @@ def build_content(formula: dict, music_path: str | Path | None, materials: Mater
                        music.path, nt.truncated_s)
 
 
+def _fill(content: dict, slots: list[str], materials: Materials, seed: int | None) -> list[Path]:
+    if not slots:
+        raise ValueError("Không còn ô thay nào sau khi ghép theo nhạc mới")
+    if isinstance(materials, list):
+        return fill_slots_ordered(content, slots, [Path(p) for p in materials])
+    if materials:
+        return fill_slots(content, slots, list_materials(materials), random.Random(seed))
+    return []
+
+
+def _build_dynamic(content: dict, formula: dict, music, same_music: bool, materials: Materials,
+                   seed: int | None, plan: BeatPlan | None, structure: Structure | None) -> BuildResult:
+    """Link động: chia phần công thức, cắt/lặp theo beat thật của nhạc mới."""
+    grid = music_grid(music.path)
+    plan = plan or default_plan(formula, grid, same_music, structure=structure)
+    result = compose(content, formula, grid, music.duration_s, plan, structure)
+    nt = SimpleNamespace(music_start_s=result.music_start_s, duration=result.duration)
+    replace_music(content, formula["music"]["segment_id"], music, nt)
+    write_beat_marks(content, formula["music"]["segment_id"],
+                     [b - round(result.music_start_s * 1_000_000) for b in result.beats_us])
+    used = _fill(content, result.kept_slots, materials, seed)
+    parts: dict[str, float] = {}
+    for p in result.pieces:
+        parts[p.part] = parts.get(p.part, 0.0) + (p.out_b - p.out_a)
+    summary = " · ".join(f"{k} {round(v, 2):g} beat" for k, v in parts.items())
+    if result.removed:
+        summary += f" · bỏ hiệu ứng: {', '.join(result.removed)}"
+    return BuildResult(content, result.tempo, result.duration / 1_000_000, result.music_start_s,
+                       used, result.kept_slots, music.path, 0.0, summary)
+
+
 def template_info(formula: dict, result: BuildResult, style_hint: str = "") -> TemplateInfo:
     return TemplateInfo(
         formula=formula["name"],
@@ -87,9 +125,11 @@ def make_caption(formula: dict, result: BuildResult, style_hint: str = "") -> Ca
 
 
 def generate(formula: dict, music_path: str | Path | None, materials: Materials,
-             name: str, seed: int | None = None, style_hint: str = "") -> tuple[Path, BuildResult, Caption]:
+             name: str, seed: int | None = None, style_hint: str = "",
+             beat_plan: BeatPlan | None = None, dynamic: bool = False,
+             structure: Structure | None = None) -> tuple[Path, BuildResult, Caption]:
     """Tạo project trong CapCut và lưu hồ sơ đăng (tiêu đề, hashtag…) vào data/outputs."""
-    result = build_content(formula, music_path, materials, seed)
+    result = build_content(formula, music_path, materials, seed, beat_plan, dynamic, structure)
     folder = write_draft(Path(formula["source"]["folder"]), name, result.content)
     info = template_info(formula, result, style_hint)
     caption = write_caption(info)
@@ -100,13 +140,15 @@ def generate(formula: dict, music_path: str | Path | None, materials: Materials,
 def generate_with_caption(formula: dict, music_path: str | Path | None, materials: Materials,
                           name: str, caption_factory: Callable[[TemplateInfo], Caption],
                           seed: int | None = None,
-                          style_hint: str = "") -> tuple[Path, BuildResult, Caption]:
+                          style_hint: str = "", beat_plan: BeatPlan | None = None,
+                          dynamic: bool = False,
+                          structure: Structure | None = None) -> tuple[Path, BuildResult, Caption]:
     """Như ``generate`` nhưng tự tạo caption từ thông tin mẫu.
 
     Dùng cho batch: kế hoạch biến thể đã có tiêu đề/hashtag riêng, không cần
     gọi lại AI cho từng project.
     """
-    result = build_content(formula, music_path, materials, seed)
+    result = build_content(formula, music_path, materials, seed, beat_plan, dynamic, structure)
     folder = write_draft(Path(formula["source"]["folder"]), name, result.content)
     info = template_info(formula, result, style_hint)
     caption = caption_factory(info)
@@ -133,5 +175,3 @@ def save_record(formula: dict, folder: Path, result: BuildResult,
     path = OUTPUTS_DIR / f"{folder.name}.json"
     path.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
     return path
-
-\n

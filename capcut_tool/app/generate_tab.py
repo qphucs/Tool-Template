@@ -14,10 +14,13 @@ from PySide6.QtWidgets import (
 from ..ai.client import AIConfig, status
 from ..formula.learn import list_formulas
 from ..generate.build import build_content, generate, make_caption
+from ..generate.compose import BeatPlan, default_plan, music_grid
+from ..generate.describe import parse_description
 from ..generate.variants import plan_variants, run_batch
 from ..generate.writer import capcut_running
 from ..media import IMAGE_EXT, VIDEO_EXT
 from .ai_dialog import AIConfigDialog
+from .beat_editor import BeatEditorDialog
 from .common import Settings, error, run_in_background
 
 AUDIO_FILTER = "Nhạc (*.mp3 *.m4a *.wav *.aac *.flac *.ogg)"
@@ -115,6 +118,25 @@ class GenerateTab(QWidget):
         photo_group.addButton(self.ordered)
         photo_group.addButton(self.random)
 
+        # link động theo beat
+        self.beat_plans: dict[str, BeatPlan] = {}
+        self.dynamic = QCheckBox("Link động: tự cắt / lặp công thức theo độ dài và beat của nhạc (không cần nhạc đúng độ dài)")
+        self.dynamic.setChecked(bool(settings.get("dynamic_beat", True)))
+        self.beat_btn = QPushButton("Chia beat & chọn chuyển cảnh…")
+        self.edit_desc = QLineEdit(settings.get("edit_description"),
+                                   placeholderText="Miêu tả cách edit (áp cho bài chưa chia beat), vd: chuyển cảnh ở beat 8, bỏ pixelate, dài 20 giây")
+        self.beat_label = QLabel()
+        self.beat_label.setObjectName("muted")
+        self.beat_label.setWordWrap(True)
+        beat_box = QGroupBox("Nhịp & chuyển cảnh")
+        bl = QVBoxLayout(beat_box)
+        row = QHBoxLayout()
+        row.addWidget(self.dynamic, 1)
+        row.addWidget(self.beat_btn)
+        bl.addLayout(row)
+        bl.addWidget(self.edit_desc)
+        bl.addWidget(self.beat_label)
+
         self.style_hint = QLineEdit(settings.get("style_hint"), placeholderText="Gợi ý phong cách cho AI viết tiêu đề, ví dụ: ảnh couple, tone neon")
         self.dry_btn = QPushButton("Chạy thử (không ghi vào CapCut)")
         self.create_btn = QPushButton("Tạo mẫu trong CapCut")
@@ -174,6 +196,7 @@ class GenerateTab(QWidget):
         layout.addLayout(top)
         layout.addWidget(self.formula_info)
         layout.addLayout(boxes)
+        layout.addWidget(beat_box)
         layout.addWidget(prompt_box)
         layout.addLayout(buttons)
         layout.addWidget(QLabel("Nhật ký:"))
@@ -194,9 +217,14 @@ class GenerateTab(QWidget):
         self.batch_dry_btn.clicked.connect(lambda: self._run_batch(dry=True))
         self.batch_btn.clicked.connect(lambda: self._run_batch(dry=False))
         self.ai_config_btn.clicked.connect(self._configure_ai)
+        self.beat_btn.clicked.connect(self._open_beat_editor)
+        self.dynamic.toggled.connect(self._dynamic_toggled)
+        self.edit_desc.textChanged.connect(lambda _t: self._update_beat_label())
+        self.music_list.currentRowChanged.connect(lambda _r: self._update_beat_label())
         self.reload_formulas()
         self._update_enabled()
         self._update_ai_label()
+        self._dynamic_toggled(self.dynamic.isChecked())
 
     # ---------- trạng thái ----------
     def reload_formulas(self) -> None:
@@ -225,6 +253,89 @@ class GenerateTab(QWidget):
         self.formula_info.setText(f"Học từ project {f['source']['draft_name']} · nhạc gốc {music.name} · "
                                   f"{f['music']['tempo']:.0f} BPM · {len(f['slots'])} ô thay")
         self._update_slot_hint()
+        self._update_beat_label()
+
+    # ---------- nhịp & chuyển cảnh ----------
+    def _beat_key(self, formula: dict, music: str | None) -> str:
+        return f"{formula['name']}|{music or '__nhac_khung__'}"
+
+    def _current_music(self) -> tuple[bool, str | None]:
+        """(có nhạc để chia không, đường dẫn nhạc hoặc None = nhạc của khung mẫu)."""
+        if self.keep_music.isChecked():
+            return True, None
+        item = self.music_list.currentItem() or (self.music_list.item(0) if self.music_list.count() else None)
+        return (item is not None), (item.data(Qt.UserRole) if item else None)
+
+    def _dynamic_toggled(self, on: bool) -> None:
+        self.settings.set("dynamic_beat", on)
+        for w in (self.beat_btn, self.edit_desc):
+            w.setEnabled(on)
+        self._update_beat_label()
+
+    def _update_beat_label(self) -> None:
+        if not hasattr(self, "beat_label"):
+            return
+        f = self._formula()
+        if f is None or not self.dynamic.isChecked():
+            self.beat_label.setText("" if f is None else
+                                    "Đang dùng cách cũ: co giãn đúng công thức, nhạc dài hơn công thức sẽ bị cắt.")
+            return
+        ok, music = self._current_music()
+        if not ok:
+            self.beat_label.setText("Thêm nhạc rồi bấm Chia beat để chọn beat chuyển cảnh cho từng bài.")
+            return
+        name = Path(music).name if music else "nhạc của khung mẫu"
+        plan = self.beat_plans.get(self._beat_key(f, music))
+        if plan is None:
+            self.beat_label.setText(f"{name}: chưa chia beat — tool tự đặt chuyển cảnh sau đúng số beat như công thức"
+                                    + (" và áp miêu tả." if self.edit_desc.text().strip() else "."))
+            return
+        end = "hết nhạc" if plan.end_index is None else f"beat {plan.end_index - plan.start_index + 1:g}"
+        removed = f", bỏ {', '.join(plan.remove_effects)}" if plan.remove_effects else ""
+        self.beat_label.setText(f"{name}: bắt đầu beat {plan.start_index + 1}, chuyển cảnh ở beat "
+                                f"{plan.transition_index - plan.start_index + 1}, kết thúc {end}, "
+                                f"chia beat {plan.density:g}×{removed}.")
+
+    def _open_beat_editor(self) -> None:
+        f = self._formula()
+        if f is None:
+            error(self, "Chưa có khung mẫu nào.")
+            return
+        ok, music = self._current_music()
+        if not ok:
+            error(self, "Hãy thêm nhạc (và chọn bài cần chia) trước.")
+            return
+        if music is None and not Path(f["music"]["path"]).is_file():
+            error(self, f"Không còn file nhạc gốc của khung mẫu: {f['music']['path']}")
+            return
+        key = self._beat_key(f, music)
+        self.settings.set("edit_description", self.edit_desc.text())
+        dlg = BeatEditorDialog(f, music, self.beat_plans.get(key), self.settings, self,
+                               description=self.edit_desc.text())
+        if dlg.exec():
+            self.beat_plans[key] = dlg.result_plan()
+            self._formula_changed()
+
+    def _plan_for(self, formula: dict, description: str, config: AIConfig, log: list[str]):
+        """Hàm chọn kế hoạch beat cho từng bài (gọi ở luồng nền)."""
+        chosen = dict(self.beat_plans)
+        cache: dict[str, BeatPlan | None] = {}
+
+        def plan_for(music):
+            key = self._beat_key(formula, music)
+            if key in chosen:
+                return chosen[key]
+            if not description:
+                return None
+            if key not in cache:
+                path = music or formula["music"]["path"]
+                grid = music_grid(path)
+                base = default_plan(formula, grid, music is None)
+                plan, notes, source = parse_description(description, formula, grid, base, config=config)
+                log.append(f"   miêu tả [{source}] cho {Path(path).name}: " + ("; ".join(notes) or "không áp được ý nào"))
+                cache[key] = plan
+            return cache[key]
+        return plan_for
 
     def _update_slot_hint(self) -> None:
         f = self._formula()
@@ -235,6 +346,7 @@ class GenerateTab(QWidget):
         self.slot_hint.setText(f"{mark} Khung mẫu có {need} ô thay, bạn đã chọn {have}. Ảnh thứ 1 vào ô xuất hiện đầu tiên.")
 
     def _update_enabled(self) -> None:
+        self._update_beat_label()
         for w in (self.music_list, self.add_music, self.remove_music):
             w.setEnabled(self.other_music.isChecked())
         for w in (self.photo_list, self.add_photos, self.up_btn, self.down_btn, self.remove_photo):
@@ -331,20 +443,28 @@ class GenerateTab(QWidget):
 
         hint = self.style_hint.text().strip()
         stamp = datetime.now().strftime("%d%m %H%M")
+        dynamic = self.dynamic.isChecked()
+        description = self.edit_desc.text().strip() if dynamic else ""
+        self.settings.set("edit_description", self.edit_desc.text())
+        config = AIConfig.load(self.settings)
         self._set_busy(True)
-        self._write(f"\n=== {'Chạy thử' if dry else 'Tạo mẫu'} · khung {formula['name']} · {len(musics)} mẫu")
+        self._write(f"\n=== {'Chạy thử' if dry else 'Tạo mẫu'} · khung {formula['name']} · {len(musics)} mẫu"
+                    + (" · link động" if dynamic else ""))
+        lines: list[str] = []  # nhật ký phân tích miêu tả được ghi vào đây trước
+        plan_for = self._plan_for(formula, description, config, lines) if dynamic else (lambda _m: None)
 
         def work():
-            lines = []
             for music in musics:
                 label = Path(music).name if music else "nhạc của khung mẫu"
                 name = f"{formula['name']} - {Path(music).stem if music else 'ảnh mới'} {stamp}"
                 try:
+                    beat_plan = plan_for(music)
                     if dry:
-                        result = build_content(formula, music, materials)
+                        result = build_content(formula, music, materials, beat_plan=beat_plan, dynamic=dynamic)
                         caption, where = make_caption(formula, result, hint), "chưa ghi"
                     else:
-                        folder, result, caption = generate(formula, music, materials, name, style_hint=hint)
+                        folder, result, caption = generate(formula, music, materials, name, style_hint=hint,
+                                                           beat_plan=beat_plan, dynamic=dynamic)
                         where = f"đã tạo project {folder.name}"
                 except Exception as e:
                     lines.append(f"✗ {label}: {e}")
@@ -352,6 +472,8 @@ class GenerateTab(QWidget):
                 source = caption.source + (f" ({caption.note})" if caption.note else "")
                 cut = (f"\n   nhạc ngắn hơn công thức nên đã cắt bớt {result.truncated_s:.1f}s cuối mẫu"
                        if result.truncated_s > 0.05 else "")
+                if result.summary:
+                    cut += f"\n   ghép: {result.summary}"
                 lines.append(
                     f"✓ {label}: {result.tempo:.0f} BPM, dài {result.duration_s:.1f}s, {where}{cut}\n"
                     f"   ô thay: {', '.join(p.name for p in result.materials)}\n"
@@ -384,16 +506,23 @@ class GenerateTab(QWidget):
             full_prompt = f"{prompt}\nPhong cách chung: {hint}".strip()
 
         stamp = datetime.now().strftime("%d%m %H%M")
+        dynamic = self.dynamic.isChecked()
+        description = self.edit_desc.text().strip() if dynamic else ""
+        self.settings.set("edit_description", self.edit_desc.text())
         self._set_busy(True)
-        self._write(f"\n=== {'Chạy thử prompt' if dry else 'Tạo nhiều mẫu'} · khung {formula['name']} · {count} mẫu")
+        self._write(f"\n=== {'Chạy thử prompt' if dry else 'Tạo nhiều mẫu'} · khung {formula['name']} · {count} mẫu"
+                    + (" · link động" if dynamic else ""))
+        desc_log: list[str] = []
+        plan_for = self._plan_for(formula, description, config, desc_log) if dynamic else None
 
         def work():
             plans, note = plan_variants(formula, full_prompt, count, len(musics), config=config)
             lines = [f"Kế hoạch: {note}"]
             lines.extend(f"   {p.index + 1}. {p.style} · {p.source}" for p in plans)
             batch = run_batch(formula, plans, musics, materials,
-                              dry=dry, stamp=stamp, ordered=ordered, vary=vary)
-            return lines + batch.lines, batch.created, batch.total
+                              dry=dry, stamp=stamp, ordered=ordered, vary=vary,
+                              dynamic=dynamic, plan_for=plan_for)
+            return lines + desc_log + batch.lines, batch.created, batch.total
 
         run_in_background(work, lambda result: self._batch_done(result, dry), self._failed)
 
@@ -405,7 +534,8 @@ class GenerateTab(QWidget):
         if dry:
             return
         if created:
-            self._write(f"Đã tạo {created}/{len(lines)} mẫu. Mở CapCut để xem; hồ sơ đăng nằm ở tab Đăng.")
+            total = sum(line.startswith(("✓", "✗")) for line in lines)
+            self._write(f"Đã tạo {created}/{total} mẫu. Mở CapCut để xem; hồ sơ đăng nằm ở tab Đăng.")
             self.drafts_created.emit()
         else:
             self._write("Không tạo được mẫu nào, xem lỗi ở trên.")

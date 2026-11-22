@@ -266,7 +266,7 @@ def rotate_materials(materials, index: int):
 
 def run_batch(formula: dict, plans: list[VariantPlan], musics: list,
               materials, *, dry: bool, stamp: str, ordered: bool,
-              vary: bool = True) -> BatchResult:
+              vary: bool = True, dynamic: bool = False, plan_for=None) -> BatchResult:
     """Tạo toàn bộ biến thể, gom lỗi từng mẫu để không dừng cả batch."""
     lines: list[str] = []
     created = 0
@@ -284,8 +284,10 @@ def run_batch(formula: dict, plans: list[VariantPlan], musics: list,
             if len(varied.get("slots", [])) != len(formula.get("slots", [])):
                 changes.append(f"giữ {len(varied['slots'])}/{len(formula['slots'])} ô thay")
 
+            beat_plan = plan_for(music) if plan_for else None
             if dry:
-                result = build_content(varied, music, mats, seed=plan.seed)
+                result = build_content(varied, music, mats, seed=plan.seed,
+                                       beat_plan=beat_plan, dynamic=dynamic)
                 info = template_info(varied, result, plan.style)
                 caption = caption_for(plan, info)
                 where = "chưa ghi"
@@ -294,6 +296,7 @@ def run_batch(formula: dict, plans: list[VariantPlan], musics: list,
                     varied, music, mats, name,
                     caption_factory=lambda info, p=plan: caption_for(p, info),
                     seed=plan.seed, style_hint=plan.style,
+                    beat_plan=beat_plan, dynamic=dynamic,
                 )
                 where = f"đã tạo project {folder.name}"
                 created += 1
@@ -301,6 +304,8 @@ def run_batch(formula: dict, plans: list[VariantPlan], musics: list,
             cut = (f", cắt {result.truncated_s:.1f}s cuối"
                    if result.truncated_s > 0.05 else "")
             extra = f" · {', '.join(changes)}" if changes else ""
+            if result.summary:
+                extra += f"\n   ghép: {result.summary}"
             lines.append(
                 f"✓ {label}: {result.tempo:.0f} BPM, {result.duration_s:.1f}s, "
                 f"{len(result.slots)} ô thay, {where}{cut}{extra}\n"
