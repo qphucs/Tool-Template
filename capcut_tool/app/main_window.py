@@ -1,4 +1,4 @@
-"""Cửa sổ chính của app: ba tab Học mẫu, Tạo mẫu, Đăng."""
+"""Cửa sổ chính của app: các tab Học mẫu, Tạo mẫu, Đăng, Marketing."""
 from __future__ import annotations
 
 import sys
@@ -12,7 +12,6 @@ from .license_gate import LicenseDialog
 from .learn_tab import LearnTab
 from .marketing_tab import MarketingTab
 from .publish_tab import PublishTab
-from .video_tab import VideoTab
 
 STYLE = """
 QWidget { font-family: 'Segoe UI'; font-size: 10pt; color: #e6e6e6; background: #1e1f22; }
@@ -45,14 +44,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CapCut Template Tool")
         self.resize(1180, 760)
         settings = Settings()
-        self.video_tab = VideoTab(settings)
         self.learn_tab = LearnTab(settings)
         self.generate_tab = GenerateTab(settings)
         self.publish_tab = PublishTab()
         self.marketing_tab = MarketingTab(settings)
 
         tabs = QTabWidget()
-        tabs.addTab(self.video_tab, "0. Từ video mẫu")
         tabs.addTab(self.learn_tab, "1. Học mẫu")
         tabs.addTab(self.generate_tab, "2. Tạo mẫu")
         tabs.addTab(self.publish_tab, "3. Đăng")
